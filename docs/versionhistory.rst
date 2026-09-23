@@ -29,6 +29,12 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed non-daemon ``to_thread.run_sync()`` worker threads blocking interpreter exit
+  forever when the event loop was stopped without draining pending tasks first (e.g. a
+  bare ``loop.run_forever()`` + ``loop.stop()``, as done by Tornado's ``IOLoop``, and
+  therefore every Jupyter server), since the done callback that tells the worker to
+  stop never got a chance to fire in that case
+  (`#1344 <https://github.com/agronholm/anyio/issues/1344>`_; PR by @akashchamp)
 
 **4.15.1**
 

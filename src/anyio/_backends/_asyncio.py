@@ -1064,6 +1064,8 @@ class WorkerThread(Thread):
         ] = Queue(2)
         self.idle_since = AsyncIOBackend.current_time()
         self.stopping = False
+        with _all_worker_threads_lock:
+            _all_worker_threads.add(self)
 
     def _report_result(
         self, future: asyncio.Future, result: Any, exc: BaseException | None
@@ -1117,6 +1119,9 @@ class WorkerThread(Thread):
                 del item, context, func, args, future, cancel_scope
 
     def stop(self, f: asyncio.Task | None = None) -> None:
+        if self.stopping:
+            return
+
         self.stopping = True
         self.queue.put_nowait(None)
         self.workers.discard(self)
@@ -1125,11 +1130,47 @@ class WorkerThread(Thread):
         except ValueError:
             pass
 
+        with _all_worker_threads_lock:
+            _all_worker_threads.discard(self)
+
 
 _threadpool_idle_workers: RunVar[deque[WorkerThread]] = RunVar(
     "_threadpool_idle_workers"
 )
 _threadpool_workers: RunVar[set[WorkerThread]] = RunVar("_threadpool_workers")
+
+# WorkerThread is not a daemon thread (making it one would risk corrupting shared
+# state if it were killed mid-operation), so under normal operation it is told to
+# stop via a done callback attached to the task that first used it. If that task
+# never completes -- e.g. because the event loop was stopped without draining
+# pending tasks, as happens with a bare loop.run_forever() + loop.stop() (what
+# Tornado's IOLoop does under the hood, and therefore every Jupyter server) -- the
+# done callback never fires, the worker is never told to stop, and, being
+# non-daemon, it blocks interpreter exit forever (see #1344).
+#
+# concurrent.futures.thread avoids the equivalent problem by hooking into
+# threading's own pre-join shutdown phase via threading._register_atexit(), rather
+# than atexit.register() (whose callbacks run too late relative to
+# threading._shutdown()'s non-daemon thread join loop to help here). Mirror that
+# fix: keep a process-wide registry of live worker threads so that any stragglers
+# can be told to stop and be joined before the interpreter tries to join them
+# itself.
+_all_worker_threads_lock = threading.Lock()
+_all_worker_threads: set[WorkerThread] = set()
+
+
+def _stop_stray_worker_threads() -> None:
+    with _all_worker_threads_lock:
+        workers = list(_all_worker_threads)
+
+    for worker in workers:
+        worker.stop()
+
+    for worker in workers:
+        worker.join()
+
+
+threading._register_atexit(_stop_stray_worker_threads)  # type: ignore[attr-defined]
 
 
 #

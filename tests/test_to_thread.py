@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import subprocess
 import sys
 import threading
 import time
@@ -9,6 +10,7 @@ import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from functools import partial
+from textwrap import dedent
 from typing import Any, NoReturn
 
 import pytest
@@ -341,6 +343,50 @@ def test_asyncio_no_recycle_stopping_worker(
     task1 = asyncio_event_loop.create_task(taskfunc1())
     task2 = asyncio_event_loop.create_task(taskfunc2())
     asyncio_event_loop.run_until_complete(asyncio.gather(task1, task2))
+
+
+def test_asyncio_worker_thread_does_not_block_interpreter_exit() -> None:
+    """
+    Regression test for #1344.
+
+    A worker thread is normally told to stop via a done callback attached to the task
+    that first used it. If that task never completes -- e.g. because the event loop
+    was stopped without draining pending tasks, as happens with a bare
+    ``loop.run_forever()`` + ``loop.stop()`` (what Tornado's ``IOLoop`` does under the
+    hood, and therefore every Jupyter server) -- that done callback never fires. Since
+    the worker thread is not a daemon thread, it must still not be allowed to block
+    interpreter exit forever.
+
+    This has to run in a subprocess because it tests actual interpreter shutdown.
+    """
+    script = dedent("""\
+        import asyncio
+
+        import anyio.to_thread
+
+
+        async def pending_forever():
+            await anyio.to_thread.run_sync(lambda: None)
+            await asyncio.Event().wait()
+
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.create_task(pending_forever())
+        loop.call_later(0.5, loop.stop)
+        loop.run_forever()
+        print("process reached the end of the main script", flush=True)
+        """)
+
+    # If the fix regresses, this call hangs until the timeout fires.
+    process = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr.decode("utf-8")
+    assert b"process reached the end of the main script" in process.stdout
 
 
 async def test_stopiteration() -> None:
